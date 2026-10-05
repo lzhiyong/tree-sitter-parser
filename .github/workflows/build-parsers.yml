@@ -1,0 +1,143 @@
+# Builds every tree-sitter parser in grammar/parsers.json for each Android architecture with the
+# latest stable NDK, zips the .so files per architecture and uploads them to the
+# "android-tree-sitter" release. The release/tag is created once; later runs only overwrite the assets.
+name: Build tree-sitter parsers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - grammar/parsers.json
+      - scripts/build_parsers.py
+      - .github/workflows/build-parsers.yml
+  workflow_dispatch:   # Also triggered by sync-parsers.yml after parsers.json changes
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: android-tree-sitter   # Tag and release title
+  ANDROID_API: 24            # Minimum Android API level the libraries target; match your app's minSdk
+  TS_ABI: ''                 # Optional: tree-sitter language ABI for generated parsers (e.g. 14).
+                             # Leave empty to use the CLI default; must not exceed what your runtime supports.
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # One failing architecture must not cancel the others
+      matrix:
+        include:
+          # name   = suffix of the zip file (Termux-style architecture names)
+          # triple = NDK clang target triple
+          - { name: aarch64, triple: aarch64-linux-android }
+          - { name: arm,     triple: armv7a-linux-androideabi }
+          - { name: i686,    triple: i686-linux-android }
+          - { name: x86_64,  triple: x86_64-linux-android }
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node.js is needed to generate parsers from grammar.js and to install the CLI
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # tree-sitter CLI, used by scripts/build_parsers.py for grammars without a pre-generated parser.c
+      - name: Install tree-sitter CLI
+        run: npm install -g tree-sitter-cli
+
+      # Ask sdkmanager for the newest NDK on the stable channel (release candidates and
+      # betas are not listed there, and versions with a "-" suffix are filtered out anyway).
+      - name: Install latest stable NDK
+        id: ndk
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true   # "yes" exits with SIGPIPE, ignore it
+          PKG=$("$SDKMANAGER" --list 2>/dev/null \
+                | awk -F'|' '{gsub(/ /, "", $1)} $1 ~ /^ndk;[0-9.]+$/ {print $1}' \
+                | sort -uV | tail -n1)
+          if [ -z "$PKG" ]; then
+            echo "Could not find an NDK package in sdkmanager --list" >&2
+            exit 1
+          fi
+          echo "Installing $PKG"
+          "$SDKMANAGER" "$PKG"
+          echo "home=$ANDROID_HOME/ndk/${PKG#ndk;}" >> "$GITHUB_OUTPUT"
+
+      # Cloned and generated sources are independent of the target architecture, so they are
+      # cached by the content of grammar/parsers.json (a changed revision means a new key).
+      - name: Cache grammar sources
+        uses: actions/cache@v4
+        with:
+          path: ts-cache
+          key: ts-sources-${{ hashFiles('grammar/parsers.json') }}
+
+      - name: Build parsers
+        env:
+          NDK_HOME: ${{ steps.ndk.outputs.home }}
+        run: |
+          BIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG="$BIN/${{ matrix.triple }}${ANDROID_API}-clang"
+
+          # Individual grammars may fail (the script logs and continues); the check below
+          # only fails the job if nothing was built at all
+          python3 scripts/build_parsers.py \
+            --json grammar/parsers.json \
+            --cache ts-cache \
+            --output libs \
+            --cc "$CLANG" \
+            --cxx "${CLANG}++" \
+            --jobs 4 \
+            ${TS_ABI:+--abi "$TS_ABI"}
+
+          ls libs/*.so > /dev/null   # Fails if no library was produced
+          echo "Built $(ls libs/*.so | wc -l) libraries for ${{ matrix.name }}"
+
+          # Strip unneeded symbols to keep the zip small
+          "$BIN/llvm-strip" --strip-unneeded libs/*.so
+
+      # .so files go at the root of the zip: tree-sitter-languages-<arch>.zip
+      - name: Package
+        run: |
+          (cd libs && zip -q -9 "$GITHUB_WORKSPACE/tree-sitter-languages-${{ matrix.name }}.zip" *.so)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: langs-${{ matrix.name }}
+          path: tree-sitter-languages-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  # A single job publishes all architectures, so the release is created and edited only once
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: langs-*
+          merge-multiple: true   # Put all zips directly into dist/
+          path: dist
+
+      - name: Publish to GitHub Releases
+        run: |
+          TAG="$RELEASE_TAG"
+
+          # The release notes only ever contain the latest commit; they are replaced, not appended
+          NEW=$(git log -1 --pretty=format:"- %s (%h)" "$GITHUB_SHA")
+          printf '### %s update\n%s\n' "$(date -u +%F' '%H:%M' UTC')" "$NEW" > notes.md
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Release exists: keep the tag untouched, replace the notes and overwrite the assets
+            gh release edit "$TAG" --notes-file notes.md
+            gh release upload "$TAG" dist/*.zip --clobber
+          else
+            # First run: create the tag and the release once
+            gh release create "$TAG" dist/*.zip \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes-file notes.md
+          fi

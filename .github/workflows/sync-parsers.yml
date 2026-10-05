@@ -1,0 +1,260 @@
+# Syncs from nvim-treesitter into this repository:
+#   1. lua/nvim-treesitter/parsers.lua  -> grammar/parsers.json  (converted to JSON)
+#   2. runtime/queries/                 -> queries/      (mirrored as-is)
+#   3. config/filetypes.json            -> extensions / file names of NEWLY added languages are
+#                                          appended, entries of REMOVED languages are deleted
+#                                          (update_filetypes.py, data from GitHub Linguist)
+# GitHub Actions cannot trigger on file changes in ANOTHER repository, so this workflow
+# polls upstream weekly and only commits when the generated output actually differs.
+# When queries/ changed it also uploads tree-sitter-queries.zip to the "android-tree-sitter" release,
+# when parsers.json changed it triggers build-parsers.yml,
+# and when filetypes.json changed it triggers publish-configs.yml.
+name: Sync nvim-treesitter
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'   # Every Monday 03:00 UTC; adjust as needed
+  workflow_dispatch:       # Allow manual runs from the Actions tab
+
+# contents: push the synced files and publish release assets
+# actions:  trigger the build / configs workflows after their inputs change
+#           (pushes made with GITHUB_TOKEN do not trigger other workflows by themselves)
+permissions:
+  contents: write
+  actions: write
+
+# Never run two syncs at once (avoids push races)
+concurrency:
+  group: sync-nvim-treesitter
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/nvim-treesitter/nvim-treesitter.git
+  UPSTREAM_BRANCH: main
+  UPSTREAM_PARSERS: lua/nvim-treesitter/parsers.lua
+  UPSTREAM_QUERIES: runtime/queries
+  OUTPUT_JSON: grammar/parsers.json   # Paths inside your own repo
+  OUTPUT_QUERIES: queries
+  RELEASE_TAG: android-tree-sitter        # Shared with build-parsers.yml: tag and release title
+  BUILD_WORKFLOW: build-parsers.yml       # Workflow file triggered when parsers.json changes
+  CONFIGS_WORKFLOW: publish-configs.yml   # Workflow file triggered when filetypes.json changes
+  OUTPUT_FILETYPES: config/filetypes.json
+  LINGUIST_URL: https://raw.githubusercontent.com/github-linguist/linguist/main/lib/linguist/languages.yml
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua and PyYAML
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4 python3-yaml
+
+      # Shallow + sparse clone of upstream: only the two paths we need, no history.
+      # It lives in the runner temp dir so it is never committed to this repo.
+      - name: Fetch upstream sources
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            --branch "$UPSTREAM_BRANCH" "$UPSTREAM_URL" "$RUNNER_TEMP/upstream"
+          git -C "$RUNNER_TEMP/upstream" sparse-checkout set \
+            "$UPSTREAM_QUERIES" "$(dirname "$UPSTREAM_PARSERS")"
+          echo "UPSTREAM_SHA=$(git -C "$RUNNER_TEMP/upstream" rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      # Evaluate the Lua table and dump "name<TAB>revision<TAB>url" lines.
+      # The upstream file is loaded in an EMPTY environment (no io/os/require), so it can only
+      # define data and cannot execute anything harmful on the runner.
+      - name: Extract install_info with Lua
+        run: |
+          cat > "$RUNNER_TEMP/extract.lua" <<'LUA'
+          local f = assert(io.open(arg[1], "r"))
+          local src = f:read("a")
+          f:close()
+
+          local chunk, err = load(src, "parsers.lua", "t", {})
+          if not chunk then
+            io.stderr:write("Failed to load parsers.lua: " .. tostring(err) .. "\n")
+            os.exit(1)
+          end
+          local ok, parsers = pcall(chunk)
+          if not ok or type(parsers) ~= "table" then
+            io.stderr:write("parsers.lua did not return a table: " .. tostring(parsers) .. "\n")
+            os.exit(1)
+          end
+
+          local names = {}
+          for name, cfg in pairs(parsers) do
+            local info = type(cfg) == "table" and cfg.install_info or nil
+            if type(info) == "table" and info.url then
+              if info.revision then
+                names[#names + 1] = name
+              else
+                io.stderr:write("Skipping " .. name .. " (no revision)\n")
+              end
+            end
+          end
+          table.sort(names)   -- Stable ordering keeps git diffs small
+
+          for _, name in ipairs(names) do
+            local info = parsers[name].install_info
+            io.write(name, "\t", info.revision, "\t", info.url, "\n")
+          end
+          LUA
+
+          lua5.4 "$RUNNER_TEMP/extract.lua" "$RUNNER_TEMP/upstream/$UPSTREAM_PARSERS" \
+            > "$RUNNER_TEMP/parsers.tsv"
+
+          # Safety check: never overwrite parsers.json with an empty result
+          if [ ! -s "$RUNNER_TEMP/parsers.tsv" ]; then
+            echo "No parsers extracted, aborting" >&2
+            exit 1
+          fi
+          echo "Extracted $(wc -l < "$RUNNER_TEMP/parsers.tsv") parsers"
+
+      # Turn the TSV into the final JSON array: [{ "name", "revision", "url" }, ...]
+      - name: Write parsers.json
+        run: |
+          python3 - <<'PY'
+          import json, os
+          tmp = os.environ["RUNNER_TEMP"]
+          rows = [l.rstrip("\n").split("\t") for l in open(f"{tmp}/parsers.tsv") if l.strip()]
+          data = [{"name": n, "revision": r, "url": u} for n, r, u in rows]
+          os.makedirs(os.path.dirname(os.environ["OUTPUT_JSON"]) or ".", exist_ok=True)
+          with open(os.environ["OUTPUT_JSON"], "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=2, ensure_ascii=False)
+              f.write("\n")
+          PY
+
+      # Keep filetypes.json in step with parsers.json, by comparing the parsers.json just
+      # generated with the one from the last commit:
+      #   - new languages get their extensions / file names added (from GitHub Linguist);
+      #     languages without any (injection-only parsers such as comment or regex) are skipped
+      #   - removed languages lose their entry; entries for languages that were never in
+      #     parsers.json (for example ones you wrote by hand) are left alone
+      # Entries of languages that stay in parsers.json are never touched.
+      # The step fails if Linguist cannot be downloaded, so the sync is retried instead of
+      # committing new languages without file types.
+      - name: Update filetypes.json
+        run: |
+          git show "HEAD:$OUTPUT_JSON" > "$RUNNER_TEMP/old_parsers.json" 2>/dev/null \
+            || echo '[]' > "$RUNNER_TEMP/old_parsers.json"
+          curl -fsSL --retry 3 --retry-delay 5 "$LINGUIST_URL" -o "$RUNNER_TEMP/languages.yml"
+          mkdir -p "$(dirname "$OUTPUT_FILETYPES")"
+          python3 scripts/update_filetypes.py \
+            --parsers "$OUTPUT_JSON" \
+            --old-parsers "$RUNNER_TEMP/old_parsers.json" \
+            --filetypes "$OUTPUT_FILETYPES" \
+            --linguist "$RUNNER_TEMP/languages.yml"
+
+      # Mirror the queries directory. --delete removes files that no longer exist upstream,
+      # so renamed/removed queries do not linger in this repo.
+      - name: Sync queries
+        run: |
+          SRC="$RUNNER_TEMP/upstream/$UPSTREAM_QUERIES"
+          if [ -z "$(ls -A "$SRC" 2>/dev/null)" ]; then
+            echo "Upstream queries directory is empty or missing, aborting" >&2
+            exit 1
+          fi
+          mkdir -p "$OUTPUT_QUERIES"
+          rsync -a --delete "$SRC/" "$OUTPUT_QUERIES/"
+
+      # Commit and push only if something really changed (git compares file contents,
+      # so a re-generated but identical file produces no diff)
+      - name: Commit changes
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A "$OUTPUT_JSON" "$OUTPUT_QUERIES"
+          # filetypes.json is only staged when it exists (git add fails on a missing path)
+          if [ -f "$OUTPUT_FILETYPES" ]; then git add "$OUTPUT_FILETYPES"; fi
+          if git diff --cached --quiet; then
+            echo "Everything is up to date, nothing to commit"
+            exit 0
+          fi
+
+          # Record which part changed so later steps only run when needed
+          git diff --cached --quiet -- "$OUTPUT_JSON"    || echo "parsers_changed=true" >> "$GITHUB_OUTPUT"
+          git diff --cached --quiet -- "$OUTPUT_QUERIES" || echo "queries_changed=true" >> "$GITHUB_OUTPUT"
+          git diff --cached --quiet -- "$OUTPUT_FILETYPES" || echo "filetypes_changed=true" >> "$GITHUB_OUTPUT"
+
+          git commit -m "chore: sync parsers, filetypes and queries from nvim-treesitter@${UPSTREAM_SHA}"
+
+          # The branch may have moved since checkout (someone pushed while this job was running),
+          # which makes a plain push fail with "fetch first". Rebase our commit onto the latest
+          # remote state and retry; only generated files are touched, so conflicts are unlikely.
+          pushed=false
+          for attempt in 1 2 3; do
+            if git pull --rebase origin "$GITHUB_REF_NAME" && git push origin "HEAD:$GITHUB_REF_NAME"; then
+              pushed=true
+              break
+            fi
+            echo "Push attempt $attempt failed, retrying..." >&2
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 5))
+          done
+          if [ "$pushed" != "true" ]; then
+            echo "Could not push after 3 attempts" >&2
+            exit 1
+          fi
+
+      # Zip the queries directory and upload it to the "android-tree-sitter" release.
+      # Runs when queries really changed, or when the release has no queries zip yet.
+      # The release/tag is created on first use and is never recreated afterwards
+      # (the asset is overwritten, the notes are replaced).
+      # Also upload when the release has no queries zip yet (first run, or after switching to a
+      # new release tag), even though queries/ itself did not change in this sync.
+      - name: Check release for queries asset
+        id: asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" --json assets -q '.assets[].name' 2>/dev/null \
+               | grep -qx 'tree-sitter-queries.zip'; then
+            echo "missing=false"
+          else
+            echo "missing=true"
+          fi >> "$GITHUB_OUTPUT"
+
+      - name: Publish queries to release
+        if: steps.commit.outputs.queries_changed == 'true' || steps.asset.outputs.missing == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="$RELEASE_TAG"
+          ZIP="$RUNNER_TEMP/tree-sitter-queries.zip"
+          rm -f "$ZIP"
+          (cd "$OUTPUT_QUERIES" && zip -qr -9 "$ZIP" .)
+
+          # Release notes = only the latest commit (replaced on every update, not appended)
+          NEW=$(git log -1 --pretty=format:"- %s (%h)")
+          printf '### %s update\n%s\n' "$(date -u +%F' '%H:%M' UTC')" "$NEW" > "$RUNNER_TEMP/notes.md"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+            gh release upload "$TAG" "$ZIP" --clobber
+          else
+            gh release create "$TAG" "$ZIP" \
+              --target "$(git rev-parse HEAD)" \
+              --title "$TAG" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+
+      # Pushes made with GITHUB_TOKEN do not start other workflows, but workflow_dispatch
+      # does, so start the parser build explicitly. It runs after the step above, which
+      # avoids both workflows creating the release at the same time.
+      - name: Trigger parser build
+        if: steps.commit.outputs.parsers_changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run "$BUILD_WORKFLOW" --ref "$GITHUB_REF_NAME"
+
+      # Same reason as above: the push does not trigger publish-configs.yml, so start it
+      # explicitly when filetypes.json changed (it packs filetypes.json + themes/).
+      - name: Trigger configs publish
+        if: steps.commit.outputs.filetypes_changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run "$CONFIGS_WORKFLOW" --ref "$GITHUB_REF_NAME"

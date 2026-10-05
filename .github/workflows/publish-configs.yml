@@ -1,0 +1,70 @@
+# Packages config/filetypes.json and the themes/ directory into tree-sitter-configs.zip and uploads
+# it to the "android-tree-sitter" release whenever either of them changes.
+# The release/tag is created once; later runs only overwrite the asset and replace the notes.
+name: Publish tree-sitter configs
+
+on:
+  push:
+    branches: [main]
+    paths:                  # Runs only when one of these files changes (add, edit or delete)
+      - config/filetypes.json
+      - themes/**
+      - .github/workflows/publish-configs.yml
+  workflow_dispatch:        # Allow manual runs from the Actions tab
+
+# Required to create the release and upload assets
+permissions:
+  contents: write
+
+# Run one publish at a time so concurrent pushes don't race on the same release
+concurrency:
+  group: publish-configs
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: android-tree-sitter   # Shared with build-parsers.yml and sync-parsers.yml
+  ZIP_NAME: tree-sitter-configs.zip
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}   # Auth for the gh CLI
+    steps:
+      - uses: actions/checkout@v4
+
+      # Zip layout: the paths are stored as they are in the repo, so the archive contains
+      # config/filetypes.json and themes/...
+      - name: Package configs
+        run: |
+          if [ ! -f config/filetypes.json ]; then
+            echo "config/filetypes.json not found" >&2
+            exit 1
+          fi
+          if [ ! -d themes ]; then
+            echo "themes/ directory not found" >&2
+            exit 1
+          fi
+          rm -f "$ZIP_NAME"
+          zip -qr -9 "$ZIP_NAME" config/filetypes.json themes
+          unzip -l "$ZIP_NAME"   # Show the contents in the log
+
+      - name: Publish to GitHub Releases
+        run: |
+          TAG="$RELEASE_TAG"
+
+          # The release notes only ever contain the latest commit; they are replaced, not appended
+          NEW=$(git log -1 --pretty=format:"- %s (%h)" "$GITHUB_SHA")
+          printf '### %s update\n%s\n' "$(date -u +%F' '%H:%M' UTC')" "$NEW" > notes.md
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Release exists: keep the tag untouched, replace the notes and overwrite the asset
+            gh release edit "$TAG" --notes-file notes.md
+            gh release upload "$TAG" "$ZIP_NAME" --clobber
+          else
+            # First run: create the tag and the release once
+            gh release create "$TAG" "$ZIP_NAME" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes-file notes.md
+          fi
