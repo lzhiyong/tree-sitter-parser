@@ -37,7 +37,6 @@
   "tree_sitter_csv": [".csv"],
   "tree_sitter_cuda": [".cu", ".cuh"],
   "tree_sitter_cue": [".cue"],
-  "tree_sitter_cylc": [".cylc", "flow.cylc"],
   "tree_sitter_d": [".d", ".di"],
   "tree_sitter_dart": [".dart"],
   "tree_sitter_desktop": [".desktop"],
